@@ -1,8 +1,11 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use log::{error, info};
-use native_tls::{Certificate, Identity, TlsConnector};
 use rumqttc::{AsyncClient, MqttOptions, QoS, Transport};
-use std::fs;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ClientConfig;
+use rustls_pemfile::{certs, private_key};
+use std::fs::File;
+use std::io::BufReader;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -52,29 +55,36 @@ fn load_tls_config(
     ca_path: &str,
     cert_path: &str,
     key_path: &str,
-) -> Result<TlsConnector, Box<dyn std::error::Error>> {
+) -> Result<ClientConfig, Box<dyn std::error::Error>> {
     // Load CA certificate
-    let ca_cert_pem = fs::read(ca_path)?;
-    let ca_cert = Certificate::from_pem(&ca_cert_pem)?;
+    let ca_file = File::open(ca_path)?;
+    let mut ca_reader = BufReader::new(ca_file);
+    let ca_certs: Vec<CertificateDer<'static>> = certs(&mut ca_reader)
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Load client certificate and key as PKCS#12/PFX
-    // native-tls requires Identity from PKCS#12, so we need to convert PEM to PKCS#12
-    let cert_pem = fs::read(cert_path)?;
-    let key_pem = fs::read(key_path)?;
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in ca_certs {
+        root_store.add(cert)?;
+    }
 
-    // Create identity from PEM certificate and key
-    let identity = Identity::from_pkcs8(&cert_pem, &key_pem)?;
+    // Load client certificate
+    let cert_file = File::open(cert_path)?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let client_certs: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Build TLS connector
-    // Disable hostname verification since we connect via k8s service name
-    // but the cert is issued for the public DNS name
-    let connector = TlsConnector::builder()
-        .add_root_certificate(ca_cert)
-        .identity(identity)
-        .danger_accept_invalid_hostnames(true)
-        .build()?;
+    // Load client private key
+    let key_file = File::open(key_path)?;
+    let mut key_reader = BufReader::new(key_file);
+    let client_key: PrivateKeyDer<'static> = private_key(&mut key_reader)?
+        .ok_or("No private key found in file")?;
 
-    Ok(connector)
+    // Build TLS config with client authentication
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(client_certs, client_key)?;
+
+    Ok(config)
 }
 
 #[actix_web::main]
@@ -103,10 +113,12 @@ async fn main() -> std::io::Result<()> {
     mqtt_options.set_keep_alive(Duration::from_secs(30));
 
     // Load TLS configuration
-    let tls_connector = load_tls_config(&ca_path, &cert_path, &key_path)
+    let tls_config = load_tls_config(&ca_path, &cert_path, &key_path)
         .expect("Failed to load TLS certificates");
 
-    mqtt_options.set_transport(Transport::tls_with_config(tls_connector.into()));
+    mqtt_options.set_transport(Transport::tls_with_config(
+        rumqttc::TlsConfiguration::Rustls(Arc::new(tls_config)),
+    ));
 
     // Create MQTT client
     let (client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
