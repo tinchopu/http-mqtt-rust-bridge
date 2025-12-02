@@ -1,12 +1,13 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use log::{error, info};
-use rumqttc::{Client, MqttOptions, QoS, TlsConfiguration, Transport};
+use rumqttc::{AsyncClient, MqttOptions, QoS, TlsConfiguration, Transport};
 use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 struct AppState {
-    mqtt_client: Arc<Client>,
+    mqtt_client: Arc<Mutex<AsyncClient>>,
 }
 
 async fn trigger_garage(data: web::Data<AppState>) -> impl Responder {
@@ -16,12 +17,13 @@ async fn trigger_garage(data: web::Data<AppState>) -> impl Responder {
     let topic = std::env::var("MQTT_TOPIC").unwrap_or_else(|_| "garage/trigger".to_string());
     let payload = std::env::var("MQTT_PAYLOAD").unwrap_or_else(|_| "1".to_string());
 
-    match data.mqtt_client.publish(
+    let client = data.mqtt_client.lock().await;
+    match client.publish(
         &topic,
         QoS::AtLeastOnce,
         false,
         payload.as_bytes(),
-    ) {
+    ).await {
         Ok(_) => {
             info!("Successfully published MQTT message");
             HttpResponse::Ok().json(serde_json::json!({
@@ -112,23 +114,19 @@ async fn main() -> std::io::Result<()> {
     mqtt_options.set_transport(Transport::Tls(tls_config));
 
     // Create MQTT client
-    let (client, mut connection) = Client::new(mqtt_options, 10);
-    let client = Arc::new(client);
+    let (client, mut eventloop) = AsyncClient::new(mqtt_options, 10);
+    let client = Arc::new(Mutex::new(client));
 
     // Spawn a task to handle the MQTT connection
     tokio::spawn(async move {
         info!("Starting MQTT event loop...");
         loop {
-            match connection.iter().next() {
-                Some(Ok(notification)) => {
+            match eventloop.poll().await {
+                Ok(notification) => {
                     info!("MQTT notification: {:?}", notification);
                 }
-                Some(Err(e)) => {
+                Err(e) => {
                     error!("MQTT connection error: {}. Retrying...", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-                None => {
-                    error!("MQTT connection closed. Retrying...");
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
