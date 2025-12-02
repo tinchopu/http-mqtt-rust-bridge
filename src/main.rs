@@ -66,9 +66,12 @@ fn load_tls_config(
     let identity = Identity::from_pkcs8(&cert_pem, &key_pem)?;
 
     // Build TLS connector
+    // Disable hostname verification since we connect via k8s service name
+    // but the cert is issued for the public DNS name
     let connector = TlsConnector::builder()
         .add_root_certificate(ca_cert)
         .identity(identity)
+        .danger_accept_invalid_hostnames(true)
         .build()?;
 
     Ok(connector)
